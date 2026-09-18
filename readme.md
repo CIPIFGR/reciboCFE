@@ -11,8 +11,8 @@ recibos **escaneados o fotografiados**, que se resuelven por OCR.
 ## Requisitos
 
 - El entorno virtual del proyecto, en `librerias/`.
-- **LM Studio** corriendo en local, solo si vas a usar `/pdf/extraer-ocr-ia`.
-  Los otros dos endpoints no lo necesitan.
+- **LM Studio** corriendo en local con el modelo de visión cargado (`LLM_VISION_MODEL`
+  del `.env`), solo si vas a usar `/pdf/extraer-ocr-ia`. Los otros dos no lo necesitan.
 
 ## Instalación y arranque
 
@@ -55,6 +55,52 @@ de LM Studio, o cuando necesites la línea del código de barras, que esa sí la
 (Los dos endpoints de escaneo dan el mismo resultado en los 26 campos restantes, incluidos
 lecturas, consumo, importes y las casillas medida/estimada.)
 
+## Límite de exactitud y hardware
+
+Sobre recibos escaneados, los dos métodos se quedan en **27 de 29 campos, ≈93 %**
+(`/pdf/extraer-ocr-ia` marca 26/29 en la tabla de arriba, pero una de esas tres
+diferencias es `TOTAL A PAGAR:`, donde lee `170.10` en vez de `170`: las dos lecturas son
+correctas, están impresas las dos en el recibo). Ese techo **no es del método: es de la
+tarjeta gráfica disponible**, y con más VRAM se puede cerrar la brecha sin salir de
+modelos locales.
+
+El equipo actual tiene una **RTX 5070 Ti Laptop de 12 GB**. En esos 12 GB solo cabe entero
+un modelo de visión de ~7B (`qwen/qwen2.5-vl-7b`, 6 GB), que responde en ~12 s pero no
+alcanza a resolver la letra más chica del recibo —la línea de dígitos arriba del código de
+barras— ni algún fragmento del domicilio.
+
+Esto no es una suposición: se midió. Con **`qwen/qwen3.8-27b`**, un modelo casi cuatro
+veces más grande, la línea del código de barras salió **correcta y completa**
+(`01 142861200719 260907 000000170 5`), igual que el número de cuenta y la tarifa. El
+problema es que ese modelo pesa 17.74 GB y pide ~20 GiB con offload completo: no cabe en
+12 GB, parte de sus capas se ejecutan en CPU y tardaba **489 s por página** (8 minutos),
+lo que lo vuelve inviable en producción. Es decir: **la exactitud ya se alcanzó; lo que
+falta es la VRAM para lograrla a una velocidad usable.**
+
+Hay además un segundo efecto en la misma dirección. La letra chica se resuelve subiendo la
+resolución con la que se rasteriza la página, pero cada aumento de resolución multiplica
+los tokens de imagen y por lo tanto la memoria de contexto. Hoy se trabaja a ~180 dpi
+porque es lo que el presupuesto de VRAM permite; con más memoria se puede alimentar al
+modelo con la página a mayor resolución **y** usar un modelo más grande al mismo tiempo.
+
+| Tarjeta                            | VRAM  | Qué permite                                                                 |
+|------------------------------------|-------|------------------------------------------------------------------------------|
+| RTX 5070 Ti Laptop (actual)        | 12 GB | Modelo de 7B completo en GPU → ~12 s y ≈93 % de exactitud                     |
+| **RTX 5090**                       | 32 GB | Modelo de 27B–32B completo en GPU, con contexto amplio y mayor resolución     |
+| **RTX PRO 6000 Blackwell**         | 96 GB | Modelos de 72B o varios modelos cargados a la vez, sin concesiones de contexto |
+
+Con cualquiera de esas dos tarjetas, el modelo que ya demostró leer los campos que hoy
+fallan correría **completo en GPU**, es decir en segundos en lugar de minutos. La ruta para
+llevar la exactitud del 93 % hacia el 100 % **sin mandar un solo recibo a un servicio
+externo** —todo el procesamiento sigue ocurriendo en la máquina— es por ahí: **más VRAM,
+no más código**.
+
+Una precisión honesta sobre el 100 %: las cifras de este documento se midieron sobre el
+recibo de ejemplo, y ningún sistema de lectura puede garantizar exactitud perfecta sobre
+cualquier documento escaneado. Lo que sí está demostrado es que los campos que hoy se
+escapan **sí los lee un modelo más grande**, y que lo único que impide usarlo es la memoria
+de la tarjeta.
+
 ## Cómo mandar el PDF
 
 Los tres endpoints de extracción aceptan el archivo de tres maneras, en este orden de
@@ -80,7 +126,7 @@ curl -X POST -F "archivo=@mi_recibo.pdf" http://127.0.0.1:8000/pdf/extraer-texto
 # Subir un recibo escaneado (OCR local, rápido)
 curl -X POST -F "archivo=@mi_recibo_escaneado.pdf" http://127.0.0.1:8000/pdf/extraer-ocr-pytorch
 
-# Recibo escaneado con el modelo de visión (tarda varios minutos)
+# Recibo escaneado con el modelo de visión
 curl -X POST -F "archivo=@mi_recibo_escaneado.pdf" http://127.0.0.1:8000/pdf/extraer-ocr-ia
 
 # Un PDF que ya está en el servidor, segunda página
@@ -244,7 +290,7 @@ DB_DATABASE=Base Datos/database.sqlite
 
 LLM_BASE_URL=http://localhost:1234/v1
 LLM_MODEL=qwen2.5-coder-14b-instruct
-LLM_VISION_MODEL=qwen/qwen3.8-27b
+LLM_VISION_MODEL=qwen/qwen2.5-vl-7b
 LLM_TIMEOUT=900
 ```
 
@@ -252,7 +298,7 @@ LLM_TIMEOUT=900
 |---------------------|-------------------------------------------------------------------|
 | `LLM_BASE_URL`      | Servidor de LM Studio (API compatible con OpenAI)                 |
 | `LLM_VISION_MODEL`  | Modelo que lee la imagen en `/pdf/extraer-ocr-ia`                 |
-| `LLM_TIMEOUT`       | Segundos de espera; el modelo actual tarda minutos por página     |
+| `LLM_TIMEOUT`       | Segundos de espera por la respuesta del modelo                    |
 | `DB_DATABASE`       | Archivo SQLite donde se guardan los recibos                       |
 | `DB_CONNECTION`     | Motor de base de datos; hoy solo se usa SQLite                    |
 

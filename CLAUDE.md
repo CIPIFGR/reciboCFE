@@ -54,13 +54,29 @@ antes de implementarla.**
     esquemas), guardado automático en cada extracción con `?guardar=false` para omitirlo,
     y reprocesar el mismo recibo **actualiza** en vez de duplicar.
 
+### 2026-09-18 — Quinta instrucción
+
+13. El usuario cambió el modelo a **Qwen2.5 VL 7B** para que quepa en su tarjeta gráfica.
+    Terminar los procesos anteriores y usar ese modelo para el OCR.
+    Hecho: se descargó el 27B, se cargó `qwen/qwen2.5-vl-7b` con offload completo a GPU y
+    se apuntó `LLM_VISION_MODEL` del `.env` al modelo nuevo. **489 s → ~12 s.**
+
+### 2026-09-18 — Sexta instrucción
+
+14. Agregar en `readme.md` que con una tarjeta gráfica más potente (RTX 5090 o
+    RTX PRO 6000 Blackwell) se podría cerrar la brecha del 93 % de exactitud hacia el
+    100 % con modelos locales, ya que el techo actual es por capacidad de hardware.
+    Hecho en la sección "Límite de exactitud y hardware", apoyada en lo medido: el
+    27B sí leyó la línea del código de barras que el 7B falla, pero tardaba 489 s por no
+    caber en 12 GB.
+
 ## Qué es
 
 API Litestar que extrae datos de recibos de CFE. Tres caminos según el PDF:
 
 - **con capa de texto** → `pdfplumber` ([app/Service/pdf_texto_service.py](app/Service/pdf_texto_service.py)), ~0.1 s
 - **escaneado, rápido** → EasyOCR/PyTorch ([app/Service/pdf_ocr_pytorch_service.py](app/Service/pdf_ocr_pytorch_service.py)), ~11 s
-- **escaneado, exacto** → modelo de visión en LM Studio ([app/Service/pdf_ocr_service.py](app/Service/pdf_ocr_service.py)), minutos
+- **escaneado, con modelo de visión** → LM Studio ([app/Service/pdf_ocr_service.py](app/Service/pdf_ocr_service.py)), ~12 s
 
 Los tres devuelven **exactamente el mismo JSON**. Los dos primeros comparten
 [app/Service/extractor_layout.py](app/Service/extractor_layout.py): reciben palabras con
@@ -158,7 +174,12 @@ por texto. Falla `CUENTA` y `TARIFA` (ver abajo).
 - la respuesta se vacía en la misma plantilla, ignorando llaves extra y normalizando
   `"null"`, `"N/A"` y cadenas vacías a `null`.
 
-Verificado contra `recibo_CFE_imagen.pdf`: coincide campo por campo con la extracción por texto.
+**Precisión medida** con `qwen/qwen2.5-vl-7b`: 26 de 29 campos. Acierta `CUENTA` y `TARIFA`
+(donde falla EasyOCR), pero no lee bien la línea de dígitos del código de barras —son muy
+chicos— y deja alguna errata en el domicilio. `TOTAL A PAGAR:` lo da como 170.1 (el total
+con centavos) mientras el extractor de texto lee el 170 del recuadro grande: las dos
+lecturas son defendibles. Subir `ESCALA_RENDER` a 3.5 acerca el código de barras pero no
+lo corrige y cuesta 3 s más, por eso se quedó en 2.5.
 
 ## Detalles del recibo CFE que ya costaron trabajo
 
@@ -217,34 +238,43 @@ Verificado contra `recibo_CFE_imagen.pdf`: coincide campo por campo con la extra
 estricto, el cliente reintenta en texto plano (el prompt ya pide JSON) y conserva el error
 original en el mensaje, que es lo que permite diagnosticar.
 
-La máquina tiene una **RTX 5070 Ti Laptop de 12 GB** (driver 610.62):
+La máquina tiene una **RTX 5070 Ti Laptop de 12 GB** (driver 610.62).
 
-- LM Studio **ya corre en CUDA** (backend `llama.cpp ... nvidia-cuda12`), pero
-  `qwen/qwen3.8-27b` pesa 17.74 GB y con offload completo pide ~20 GiB: no cabe en 12 GB y
-  parte de las capas quedan en CPU. De ahí los minutos por página y `LLM_TIMEOUT=900`.
-- **No volver a tocar los parámetros de carga desde `lms`.** Se intentó bajar el contexto
-  a 16384 con `--parallel 1` (VRAM 9.0 → 11.3 GB) y después fijar el offload a mano; en
-  ambos casos el resultado fue peor: peticiones con imagen respondiendo 400, generaciones
-  de más de 10 minutos sin terminar y, con `--gpu 0.235`, el motor **muriéndose** a mitad
-  de la generación (`{"error":"terminated"}` a los 466 s, seguido de
-  `No engine protocol runtime is registered`). La receta de carga es
-  `lms load qwen/qwen3.8-27b -c 98304 --parallel 4 --ttl 3600 -y`; si el endpoint de
-  visión sigue fallando, recargar el modelo **desde la interfaz de LM Studio**, que es
-  donde estaba cargado originalmente y aplica sus propios ajustes (el offload a GPU no
-  aparece en `lms ps`, así que no se puede reproducir a ciegas desde el CLI).
-- Medición de VRAM por offload, para referencia: sin modelo 371 MiB · `--gpu 0.15`
-  7081 MiB · `0.2` 8199 MiB · `0.235` 9367 MiB · `0.3` 10705 MiB · auto 11759 MiB.
-- La única salida real es un **modelo de visión que quepa entero en 12 GB** (7B–12B
-  cuantizado, ~6–8 GB). Implica descargarlo: decisión del usuario.
-- **PyTorch está instalado en build `+cpu`**, así que EasyOCR corre en CPU (aun así, 11 s).
-  Para GPU hay que reinstalar con ruedas `cu128` o superiores (la RTX 5070 Ti es Blackwell):
-  `pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128`.
-  No hay que tocar el código: `obtener_lector()` ya pasa `gpu=torch.cuda.is_available()`.
+**Configuración actual (la buena):** `qwen/qwen2.5-vl-7b` cargado **entero en la GPU**.
 
-Comandos útiles para experimentar:
+```powershell
+lms load qwen/qwen2.5-vl-7b --gpu max -c 32768 --parallel 1 --ttl 3600 -y
+# 6.04 GB de modelo, 8.8 GB de VRAM ocupada de 12  ->  ~12 s por página
+```
+
+**Lección aprendida, no repetir:** antes se usaba `qwen/qwen3.8-27b` (17.74 GB, ~20 GiB
+con offload completo). No cabía en 12 GB, parte de las capas iban a CPU y tardaba **489 s
+por página**. Se intentó arreglar por configuración —bajar el contexto a 16384 con
+`--parallel 1`, y después fijar el offload a mano— y todo salió peor: peticiones con
+imagen respondiendo 400, generaciones de más de 10 minutos sin terminar y, con
+`--gpu 0.235`, el motor muriéndose a media generación (`{"error":"terminated"}` a los
+466 s, seguido de `No engine protocol runtime is registered`). **Cuando el modelo no cabe,
+el arreglo es cambiar de modelo, no ajustar la carga.** Medición de VRAM por offload del
+27B, por si sirve de referencia: sin modelo 371 MiB · `--gpu 0.15` 7081 · `0.2` 8199 ·
+`0.235` 9367 · `0.3` 10705 · auto 11759.
+
+`LLM_TIMEOUT=900` quedó de la época del 27B; con el modelo actual sobra y se puede bajar.
+
+El modelo de visión devuelve todo como texto (`"$170.10"`, `"5,223"`). `normalizar()` en
+`pdf_ocr_service.py` aplica los tipos del proyecto para que su salida sea intercambiable
+con la de los otros dos métodos y entre bien en SQLite: `buscar_seccion` siempre texto
+(si no, el código de barras se convertiría en un número enorme), identificadores como
+texto y primer token, consumo e importe a número cuando el texto lo es.
+
+**PyTorch está instalado en build `+cpu`**, así que EasyOCR corre en CPU (aun así, 11 s).
+Para GPU hay que reinstalar con ruedas `cu128` o superiores (la RTX 5070 Ti es Blackwell):
+`pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128`.
+No hay que tocar el código: `obtener_lector()` ya pasa `gpu=torch.cuda.is_available()`.
+
+Comandos útiles:
 
 ```powershell
 lms ps                                                            # contexto, paralelismo, tamaño
-lms load <modelo> -c <contexto> --parallel 1 --estimate-only -y   # estimar sin cargar
+lms load <modelo> --gpu max -c <contexto> --estimate-only -y      # estimar VRAM sin cargar
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv      # VRAM real en uso
 ```

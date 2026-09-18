@@ -1,0 +1,13 @@
+{
+    "lm_studio": "http://localhost:1234/v1",
+    "modelos": [
+        "qwen/qwen2.5-vl-7b",
+        "qwen2.5-coder-14b-instruct",
+        "qwen/qwen3.8-27b",
+        "text-embedding-nomic-embed-text-v1.5"
+    ],
+    "modelo_vision": "qwen/qwen2.5-vl-7b",
+    "ocr_pytorch": {
+        "dispositivo": "cpu"
+    }
+}
