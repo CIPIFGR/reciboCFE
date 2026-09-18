@@ -1,0 +1,5 @@
+librerias/
+__pycache__/
+*.pyc
+.env
+Base Datos/*.sqlite

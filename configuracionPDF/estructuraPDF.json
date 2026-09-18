@@ -1,0 +1,42 @@
+{
+	"archivo_origen": [
+		"CFE"
+	],
+	"extraer": {
+		"buscar_seccion": {
+			"superior izquierda": ["nombre_completo", "calle"],
+			"inferior al centro": ["arriba de código de barras código"]
+		},
+		"columnas_servicio": [
+			"NO. DE SERVICIO",
+			"RMU",
+			"CUENTA",
+			"TARIFA",
+			"MULTIPLICADOR",
+			"NO. MEDIDOR",
+			"NO HILOS"
+		],
+		"columnas_consumo": [
+			"total_periodo",
+			"LÍMITE DE PAGO",
+			"CORTE A PARTIR",
+			"PERIODO FACTURADO",
+			"TOTAL A PAGAR:",
+			"Subtotal",
+			"Precio",
+			{
+				"lectura_actual": ["medida", "estimada", "valor"]
+			},
+			{
+				"lectura_anterior": ["medida", "estimada", "valor kWh"]
+			}
+		],
+		"importe": [
+			"Energía",
+			"IVA 16%",
+			"Fac. del Periodo",
+			"Total",
+			"Apoyo Gubernamental"
+		]
+	}
+}
