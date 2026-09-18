@@ -40,8 +40,19 @@ antes de implementarla.**
 11. Pasar el contenido de `readme.md` a `claude.md`, para que `readme.md` quede como el
     archivo final de uso de la API.
 
-> **Pendiente**: persistencia en SQLite (punto 8), a la espera de las indicaciones del usuario.
-> `DB_CONNECTION` y `DB_DATABASE` ya están en el `.env` y `app/config.py` expone `settings.db_path`.
+### 2026-09-18 — Cuarta instrucción
+
+12. Con SQLite en la carpeta `Base Datos`, guardar el contenido de lo que se extrae, con
+    estas tablas (el usuario las nombró `cfe.servicio`, `cfe.consumo`, `cfe.importe` y
+    `cfe.cliente`):
+    - **servicio** ← `columnas_servicio`
+    - **consumo** ← `columnas_consumo`, incluidas `lectura_actual` y `lectura_anterior`
+    - **importe** ← `importe`
+    - **cliente** ← `nombre_completo`, `calle` y la cuenta
+
+    Decisiones consultadas y aprobadas por el usuario: prefijo `cfe_` (SQLite no tiene
+    esquemas), guardado automático en cada extracción con `?guardar=false` para omitirlo,
+    y reprocesar el mismo recibo **actualiza** en vez de duplicar.
 
 ## Qué es
 
@@ -106,6 +117,7 @@ app/Service/
   pdf_ocr_pytorch_service.py  pypdfium2 -> EasyOCR -> palabras en puntos -> extractor_layout
   pdf_ocr_service.py          pypdfium2 -> PNG base64 -> modelo de visión -> normalizar()
   llm_client.py               LM Studio (API estilo OpenAI); LMStudioError
+  base_datos_service.py       DDL derivado de estructuraPDF.json + upsert en SQLite
 ```
 
 Entrada de los endpoints, por prioridad: archivo multipart (`archivo`) → parámetro `ruta`
@@ -174,6 +186,30 @@ Verificado contra `recibo_CFE_imagen.pdf`: coincide campo por campo con la extra
   (`32DN7ODO11002050`, `OI`). **No corregir a ciegas** (hay cuentas con letra `O` real);
   si se necesita exactitud en esos campos, usar `extraer_ocr_ia`, que sí los acierta.
 
+## Base de datos
+
+`app/Service/base_datos_service.py`. `main.py` llama a `inicializar()` en `on_startup`.
+
+- **Las columnas salen de `estructuraPDF.json`**, igual que el JSON de la respuesta: la
+  función `columna()` convierte la etiqueta del recibo en nombre SQL
+  (`LÍMITE DE PAGO` → `limite_de_pago`, `('lectura_actual','valor kWh')` →
+  `lectura_actual_valor_kwh`). Agregar un campo al JSON agrega la columna;
+  `inicializar()` hace `ALTER TABLE ADD COLUMN` si la base ya existía.
+- **Llaves**: `CAMPO_CUENTA` (`CUENTA`) liga las cuatro tablas y `CAMPO_PERIODO`
+  (`PERIODO FACTURADO`) distingue recibos. Son constantes del módulo, no listas de campos:
+  elegir la llave es decisión de diseño, no configuración.
+- **Tipos**: por tabla (`_TIPO_POR_DEFECTO`), con excepciones explícitas en
+  `_TIPOS_EXPLICITOS`. `cfe_servicio` y `cfe_cliente` van en TEXT para conservar los ceros
+  a la izquierda; `medida`/`estimada` en INTEGER porque SQLite no tiene booleanos.
+- **Upsert** con `ON CONFLICT ... DO UPDATE`: reprocesar un recibo lo corrige.
+- **Aviso de cuenta parecida**: `_cuenta_parecida()` detecta una cuenta ya registrada que
+  solo difiera en `O`/`0` o `I`/`1` y lo reporta en `guardado.aviso`. **No corrige el
+  dato**: hay cuentas con letra `O` real. Sin este aviso, el mismo cliente terminaba
+  duplicado al guardar la salida del OCR (se comprobó: `32DN7ODO11002050` contra
+  `32DN70D011002050`).
+- Un fallo de SQLite **no invalida la extracción**: el controlador lo devuelve en
+  `guardado.ok = false` con el motivo.
+
 ## LM Studio y GPU
 
 `GET /pdf/salud` lista los modelos cargados y el dispositivo del OCR. LM Studio solo acepta
@@ -186,11 +222,18 @@ La máquina tiene una **RTX 5070 Ti Laptop de 12 GB** (driver 610.62):
 - LM Studio **ya corre en CUDA** (backend `llama.cpp ... nvidia-cuda12`), pero
   `qwen/qwen3.8-27b` pesa 17.74 GB y con offload completo pide ~20 GiB: no cabe en 12 GB y
   parte de las capas quedan en CPU. De ahí los minutos por página y `LLM_TIMEOUT=900`.
-- **No repetir el intento de bajar contexto a 16384 con `--parallel 1`**: sube la VRAM
-  usada de 9.0 a 11.3 GB de 12, Windows empieza a paginar memoria de video contra la RAM
-  y queda más lento — peticiones con imagen respondiendo 400 y generaciones de más de
-  10 minutos sin terminar. La configuración que funciona es la original:
-  `lms load qwen/qwen3.8-27b -c 98304 --parallel 4 --ttl 3600 -y`.
+- **No volver a tocar los parámetros de carga desde `lms`.** Se intentó bajar el contexto
+  a 16384 con `--parallel 1` (VRAM 9.0 → 11.3 GB) y después fijar el offload a mano; en
+  ambos casos el resultado fue peor: peticiones con imagen respondiendo 400, generaciones
+  de más de 10 minutos sin terminar y, con `--gpu 0.235`, el motor **muriéndose** a mitad
+  de la generación (`{"error":"terminated"}` a los 466 s, seguido de
+  `No engine protocol runtime is registered`). La receta de carga es
+  `lms load qwen/qwen3.8-27b -c 98304 --parallel 4 --ttl 3600 -y`; si el endpoint de
+  visión sigue fallando, recargar el modelo **desde la interfaz de LM Studio**, que es
+  donde estaba cargado originalmente y aplica sus propios ajustes (el offload a GPU no
+  aparece en `lms ps`, así que no se puede reproducir a ciegas desde el CLI).
+- Medición de VRAM por offload, para referencia: sin modelo 371 MiB · `--gpu 0.15`
+  7081 MiB · `0.2` 8199 MiB · `0.235` 9367 MiB · `0.3` 10705 MiB · auto 11759 MiB.
 - La única salida real es un **modelo de visión que quepa entero en 12 GB** (7B–12B
   cuantizado, ~6–8 GB). Implica descargarlo: decisión del usuario.
 - **PyTorch está instalado en build `+cpu`**, así que EasyOCR corre en CPU (aun así, 11 s).

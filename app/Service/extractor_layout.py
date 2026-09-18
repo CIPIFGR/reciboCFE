@@ -20,8 +20,9 @@ from typing import Any, Sequence
 
 from app.Service.estructura_service import EstructuraPDF, estructura_pdf
 
-# Campos cuyo valor es un solo token (evita arrastrar el resto de la linea).
-_UN_TOKEN = {
+# Identificadores: su valor es un solo token y se conserva como texto para no perder
+# ceros a la izquierda ('01'). Lo usa tambien el normalizador del modelo de vision.
+CAMPOS_IDENTIFICADOR = {
     "NO. DE SERVICIO",
     "RMU",
     "CUENTA",
@@ -170,7 +171,7 @@ class ExtractorLayout:
                 resto = resto.strip(" .;-")
                 if not resto:  # el valor esta en el renglon de abajo (TOTAL A PAGAR:)
                     resto = next((r.strip() for r in renglones[i + 1:] if r.strip()), "")
-                identificador = etiqueta in _UN_TOKEN
+                identificador = etiqueta in CAMPOS_IDENTIFICADOR
                 if identificador and resto.split():
                     resto = resto.split()[0]
                 clave = next(

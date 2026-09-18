@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -14,6 +16,7 @@ from litestar.exceptions import ClientException, HTTPException, NotFoundExceptio
 from litestar.params import Body
 
 from app.config import BASE_DIR, CONFIG_PDF_DIR
+from app.Service.base_datos_service import base_datos_service
 from app.Service.llm_client import LMStudioError, lm_studio_client
 from app.Service.pdf_ocr_pytorch_service import hay_gpu, pdf_ocr_pytorch_service
 from app.Service.pdf_ocr_service import pdf_ocr_service
@@ -45,13 +48,18 @@ class PDFController(Controller):
         data: CuerpoPDF,
         ruta: str | None = None,
         pagina: int = 0,
+        guardar: bool = True,
     ) -> dict[str, Any]:
         origen = await self._origen(data.archivo, ruta, PDF_TEXTO_EJEMPLO)
         try:
             resultado = pdf_texto_service.extraer(origen, pagina=pagina)
         except ValueError as exc:
             raise ClientException(detail=str(exc)) from exc
-        return {"metodo": "texto", "datos": resultado}
+        return {
+            "metodo": "texto",
+            "guardado": await self._guardar(resultado, "texto", data.archivo, ruta, guardar),
+            "datos": resultado,
+        }
 
     @post("/extraer-ocr-ia", summary="Extrae un recibo CFE escaneado con el modelo de vision")
     async def extraer_ocr_ia(
@@ -59,6 +67,7 @@ class PDFController(Controller):
         data: CuerpoPDF,
         ruta: str | None = None,
         pagina: int = 0,
+        guardar: bool = True,
     ) -> dict[str, Any]:
         origen = await self._origen(data.archivo, ruta, PDF_IMAGEN_EJEMPLO)
         try:
@@ -67,7 +76,12 @@ class PDFController(Controller):
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise ClientException(detail=str(exc)) from exc
-        return {"metodo": "ocr_ia", "modelo": lm_studio_client.modelo_vision, "datos": resultado}
+        return {
+            "metodo": "ocr_ia",
+            "modelo": lm_studio_client.modelo_vision,
+            "guardado": await self._guardar(resultado, "ocr_ia", data.archivo, ruta, guardar),
+            "datos": resultado,
+        }
 
     @post("/extraer-ocr-pytorch", summary="Extrae un recibo CFE escaneado con OCR local (EasyOCR/PyTorch)")
     async def extraer_ocr_pytorch(
@@ -75,6 +89,7 @@ class PDFController(Controller):
         data: CuerpoPDF,
         ruta: str | None = None,
         pagina: int = 0,
+        guardar: bool = True,
     ) -> dict[str, Any]:
         origen = await self._origen(data.archivo, ruta, PDF_IMAGEN_EJEMPLO)
         try:
@@ -87,6 +102,7 @@ class PDFController(Controller):
         return {
             "metodo": "ocr_pytorch",
             "dispositivo": "cuda" if hay_gpu() else "cpu",
+            "guardado": await self._guardar(resultado, "ocr_pytorch", data.archivo, ruta, guardar),
             "datos": resultado,
         }
 
@@ -104,6 +120,25 @@ class PDFController(Controller):
         }
 
     # --- helpers --------------------------------------------------------------
+    @staticmethod
+    async def _guardar(
+        datos: dict[str, Any],
+        metodo: str,
+        archivo: UploadFile | None,
+        ruta: str | None,
+        guardar: bool,
+    ) -> dict[str, Any]:
+        """Persiste el recibo en SQLite. Un fallo de base no invalida la extraccion."""
+        if not guardar:
+            return {"ok": False, "motivo": "Omitido por el parametro guardar=false"}
+        nombre = archivo.filename if archivo is not None else (ruta or "ejemplo")
+        try:
+            return await to_thread.run_sync(
+                partial(base_datos_service.guardar, datos, metodo=metodo, archivo=nombre)
+            )
+        except sqlite3.Error as exc:
+            return {"ok": False, "motivo": f"Error de SQLite: {exc}"}
+
     @staticmethod
     async def _origen(archivo: UploadFile | None, ruta: str | None, ejemplo: Path) -> io.BytesIO:
         """Prioridad: archivo subido > parametro `ruta` > PDF de ejemplo del repo."""

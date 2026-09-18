@@ -1,0 +1,62 @@
+{
+    "metodo": "texto",
+    "guardado": {
+        "ok": true,
+        "base": "C:\\Users\\blais\\OneDrive\\Documentos\\FGR\\UERI\\IA análisis\\reciboCFE\\Base Datos\\database.sqlite",
+        "cuenta": "32DN70D011002050",
+        "periodo": "23 JUN 26-24 AGO 26",
+        "tablas": [
+            "cfe_cliente",
+            "cfe_servicio",
+            "cfe_consumo",
+            "cfe_importe"
+        ]
+    },
+    "datos": {
+        "archivo_origen": "CFE",
+        "buscar_seccion": {
+            "superior izquierda": {
+                "nombre_completo": "FIGUEROA ROSAS LUCIO GUILLERMO",
+                "calle": "CALLE MONTE BELLO LT66 MZ13, MONTE CARMELO Y CARR SAN PABLO, SAN LUCAS XOCHIMANCAC.P.16300, XOCHIMILCO,CDMX"
+            },
+            "inferior al centro": {
+                "arriba de código de barras código": "01 142861200719 260907 000000170 5"
+            }
+        },
+        "columnas_servicio": {
+            "NO. DE SERVICIO": "142861200719",
+            "RMU": "16300",
+            "CUENTA": "32DN70D011002050",
+            "TARIFA": "01",
+            "MULTIPLICADOR": "1",
+            "NO. MEDIDOR": "414JVA",
+            "NO HILOS": "1"
+        },
+        "columnas_consumo": {
+            "total_periodo": 130,
+            "LÍMITE DE PAGO": "07 SEP 2026",
+            "CORTE A PARTIR": "08 SEP 2026",
+            "PERIODO FACTURADO": "23 JUN 26-24 AGO 26",
+            "TOTAL A PAGAR:": 170,
+            "Subtotal": 146.64,
+            "Precio": 1.128,
+            "lectura_actual": {
+                "medida": true,
+                "estimada": false,
+                "valor": 5223
+            },
+            "lectura_anterior": {
+                "medida": true,
+                "estimada": false,
+                "valor kWh": 5093
+            }
+        },
+        "importe": {
+            "Energía": 146.64,
+            "IVA 16%": 23.46,
+            "Fac. del Periodo": 170.1,
+            "Total": 170.1,
+            "Apoyo Gubernamental": 273.82
+        }
+    }
+}

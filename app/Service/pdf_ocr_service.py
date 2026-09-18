@@ -16,6 +16,7 @@ from typing import Any, BinaryIO
 import pypdfium2 as pdfium
 
 from app.Service.estructura_service import EstructuraPDF, estructura_pdf
+from app.Service.extractor_layout import CAMPOS_IDENTIFICADOR, a_numero
 from app.Service.llm_client import LMStudioClient, LMStudioError, lm_studio_client
 
 ESCALA_RENDER = 2.5  # ~180 dpi sobre una hoja carta: suficiente para el OCR del modelo
@@ -31,9 +32,13 @@ Reglas:
 - 'medida' y 'estimada' son las casillas de la tabla de consumo: true en la casilla
   que tiene la X y false en la otra.
 - 'total_periodo' es la columna 'Total periodo' de la tabla de consumo (kWh del periodo).
-- 'arriba de código de barras código' es la linea de digitos impresa justo arriba
-  del codigo de barras del talon de pago.
-- 'nombre_completo' y 'calle' estan en el bloque superior izquierdo del recibo.
+- 'arriba de código de barras código': hasta abajo al centro, en el talon de pago, hay un
+  codigo de barras; justo ARRIBA de las barras va impresa una linea larga de digitos
+  repartidos en varios grupos separados por espacios. Copiala completa y tal cual,
+  respetando los espacios. No la confundas con el numero de servicio ni con la cuenta.
+- 'nombre_completo' y 'calle' estan en el bloque superior izquierdo del recibo:
+  el nombre es el primer renglon y 'calle' es TODO el domicilio que sigue debajo
+  (calle, colonia, codigo postal, alcaldia y estado) en una sola cadena separada por comas.
 
 Esquema JSON de la respuesta:
 """
@@ -115,27 +120,62 @@ class PDFOCRService:
             return None if texto.lower() in ("", "null", "none", "n/a", "no aplica") else texto
         return valor
 
+    @staticmethod
+    def _identificador(valor: Any) -> Any:
+        """'16300 86-12-29 FIRL-480208' -> '16300'; siempre texto, nunca numero."""
+        if valor is None:
+            return None
+        texto = str(valor).strip()
+        return texto.split()[0] if texto.split() else None
+
+    @staticmethod
+    def _numerico(valor: Any) -> Any:
+        """El modelo devuelve '$170.10' o '5,223'; aqui pasan a numero como en los otros metodos.
+
+        Si el texto no es numerico (fechas, periodos) se queda tal cual.
+        """
+        if not isinstance(valor, str):
+            return valor
+        numero = a_numero(valor)
+        return valor if numero is None else numero
+
     def normalizar(self, crudo: dict[str, Any]) -> dict[str, Any]:
-        """Vacia la respuesta del modelo en la plantilla: mismas llaves, mismo orden."""
+        """Vacia la respuesta del modelo en la plantilla y le aplica los tipos del proyecto.
+
+        El modelo entrega todo como texto ('$170.10', '5,223'); aqui se convierte para que
+        la salida sea intercambiable con la de los otros dos metodos y entre bien en SQLite:
+          * buscar_seccion  -> siempre texto (el codigo de barras no debe volverse numero)
+          * identificadores -> texto y primer token ('01' conserva el cero)
+          * consumo/importe -> numero cuando el texto lo es; fechas y periodos se quedan
+        """
         resultado = self.estructura.plantilla()
-        resultado["archivo_origen"] = (
-            self._limpiar(crudo.get("archivo_origen")) or self.estructura.archivo_origen
-        )
+        # Constante que identifica al documento: se toma del archivo de configuracion,
+        # no de lo que el modelo quiera contestar ('Recibo de luz CFE').
+        resultado["archivo_origen"] = self.estructura.archivo_origen
 
         for grupo, campos in resultado["buscar_seccion"].items():
             origen = (crudo.get("buscar_seccion") or {}).get(grupo) or {}
             for campo in campos:
-                campos[campo] = self._limpiar(origen.get(campo))
+                valor = self._limpiar(origen.get(campo))
+                campos[campo] = None if valor is None else str(valor)
 
-        for bloque in ("columnas_servicio", "columnas_consumo", "importe"):
+        origen = crudo.get("columnas_servicio") or {}
+        for campo in resultado["columnas_servicio"]:
+            valor = self._limpiar(origen.get(campo))
+            resultado["columnas_servicio"][campo] = (
+                self._identificador(valor) if campo in CAMPOS_IDENTIFICADOR else valor
+            )
+
+        for bloque in ("columnas_consumo", "importe"):
             origen = crudo.get(bloque) or {}
             for campo, valor in resultado[bloque].items():
                 if isinstance(valor, dict):  # lectura_actual / lectura_anterior
                     anidado = origen.get(campo) or {}
                     for sub in valor:
-                        valor[sub] = self._limpiar(anidado.get(sub))
+                        limpio = self._limpiar(anidado.get(sub))
+                        valor[sub] = limpio if sub in ("medida", "estimada") else self._numerico(limpio)
                 else:
-                    resultado[bloque][campo] = self._limpiar(origen.get(campo))
+                    resultado[bloque][campo] = self._numerico(self._limpiar(origen.get(campo)))
         return resultado
 
 
