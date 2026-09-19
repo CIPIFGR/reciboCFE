@@ -19,6 +19,7 @@ class LMStudioClient:
         self.timeout = config.llm_timeout
         self.modelo_texto = config.llm_model
         self.modelo_vision = config.llm_vision_model
+        self.modelo_revision = config.llm_revision_model
 
     async def modelos(self) -> list[str]:
         async with httpx.AsyncClient(timeout=30) as cliente:

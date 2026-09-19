@@ -12,7 +12,9 @@ recibos **escaneados o fotografiados**, que se resuelven por OCR.
 
 - El entorno virtual del proyecto, en `librerias/`.
 - **LM Studio** corriendo en local con el modelo de visión cargado (`LLM_VISION_MODEL`
-  del `.env`), solo si vas a usar `/pdf/extraer-ocr-ia`. Los otros dos no lo necesitan.
+  del `.env`), solo si vas a usar `/pdf/extraer-ocr-ia`. El modelo de revisión
+  (`LLM_REVISION_MODEL`) solo tiene que estar descargado: LM Studio lo carga al pedirlo.
+  Los otros dos endpoints no necesitan LM Studio.
 
 ## Instalación y arranque
 
@@ -38,68 +40,138 @@ Para comprobar que todo responde: `GET /pdf/salud`.
 
 ### Cuál usar
 
-| Endpoint                   | Tiempo | Aciertos contra la lectura por texto                        | LM Studio |
-|----------------------------|--------|-------------------------------------------------------------|-----------|
-| `/pdf/extraer-texto`       | ~0.1 s | 29/29 (es la referencia)                                    | No        |
-| `/pdf/extraer-ocr-pytorch` | ~11 s  | 27/29 — falla `CUENTA` y `TARIFA` (confunde `O`/`0`, `I`/`1`) | No        |
-| `/pdf/extraer-ocr-ia`      | ~12 s  | 26/29 — acierta `CUENTA` y `TARIFA`; falla la línea del código de barras | Sí |
+| Endpoint                                  | Tiempo    | Aciertos contra la lectura por texto | LM Studio |
+|-------------------------------------------|-----------|--------------------------------------|-----------|
+| `/pdf/extraer-texto`                      | ~0.1 s    | 29/29 (es la referencia)             | No        |
+| `/pdf/extraer-ocr-pytorch`                | ~11 s     | 27/29 — falla `CUENTA` y `TARIFA` (confunde `O`/`0`, `I`/`1`) | No |
+| `/pdf/extraer-ocr-ia` (por omisión)       | ~2.5 min  | **28/29** — solo difiere un signo de puntuación en el domicilio | Sí |
+| `/pdf/extraer-ocr-ia?revisar=false`       | ~15 s     | 26/29 — falla código de barras, domicilio y total a pagar | Sí |
 
 Empieza siempre por `/pdf/extraer-texto`: si el PDF no trae capa de texto responde **400**
-y ahí eliges entre los dos endpoints de escaneo.
+y ahí eliges entre los endpoints de escaneo.
 
-Para recibos escaneados, **`/pdf/extraer-ocr-ia` es la opción recomendada**: tarda
-prácticamente lo mismo que el OCR local y lee bien el número de cuenta y la tarifa, que es
-justo donde el OCR se equivoca. Usa `/pdf/extraer-ocr-pytorch` cuando no quieras depender
-de LM Studio, o cuando necesites la línea del código de barras, que esa sí la lee bien.
+Para recibos escaneados:
 
-(Los dos endpoints de escaneo dan el mismo resultado en los 26 campos restantes, incluidos
-lecturas, consumo, importes y las casillas medida/estimada.)
+- **Cuando importa la exactitud: `/pdf/extraer-ocr-ia`** tal cual. Es la lectura más
+  exacta de las tres: el modelo de visión lee el recibo y un modelo más grande relee los
+  campos difíciles. Tarda ~2.5 minutos por la segunda pasada.
+- **Cuando importa la velocidad: `/pdf/extraer-ocr-ia?revisar=false`** (~15 s). Lee bien
+  cuenta y tarifa, pero no la línea del código de barras ni el total a pagar.
+- **Sin LM Studio: `/pdf/extraer-ocr-pytorch`** (~11 s). Lee bien la línea del código de
+  barras, pero confunde letras con dígitos en la cuenta y la tarifa.
+
+## Revisión con el modelo grande
+
+`/pdf/extraer-ocr-ia` trabaja en dos pasadas:
+
+1. **Modelo de visión** (`LLM_VISION_MODEL`, hoy `qwen/qwen2.5-vl-7b`). Cabe entero en la
+   tarjeta gráfica y lee todo el recibo en unos 15 segundos.
+2. **Modelo de revisión** (`LLM_REVISION_MODEL`, hoy `qwen/qwen3.8-27b`). Se le piden
+   **solo los campos dudosos**; todo lo que el primero ya leyó bien se queda como está.
+
+Un campo se considera dudoso cuando:
+
+| Motivo        | Qué significa                                                                        |
+|---------------|--------------------------------------------------------------------------------------|
+| `configurado` | Está en `LLM_REVISION_CAMPOS`: el modelo de visión lo lee mal de forma sistemática   |
+| `vacio`       | El modelo de visión no lo encontró                                                    |
+| `formato`     | No tiene la forma esperada (la línea del código de barras solo lleva dígitos)        |
+| `no cuadra`   | No es consistente con otros campos del recibo (ver abajo)                            |
+
+Las reglas de consistencia se verifican con los propios datos del recibo, sin necesidad de
+conocer la respuesta correcta:
+
+- **(lectura actual − lectura anterior) × multiplicador = total del periodo.** Si no da,
+  se releen las tres cifras.
+- **Energía + IVA = facturado en el periodo** (con tolerancia de 5 centavos). Si no da,
+  se releen los tres importes.
+
+Por qué hace falta la lista `LLM_REVISION_CAMPOS`: en producción no hay contra qué comparar,
+y algunos errores del modelo chico no dejan huella — el campo trae un valor con la forma
+correcta, solo que está mal leído. Esos se identificaron midiendo, y se releen siempre:
+
+```
+LLM_REVISION_CAMPOS=arriba de código de barras código;calle;TOTAL A PAGAR:
+```
+
+Los nombres van tal como en `estructuraPDF.json`, separados por `;`. Para un campo anidado
+se usa punto: `lectura_actual.valor`.
+
+**La revisión nunca empeora el resultado**: si el modelo grande falla, no responde o no
+encuentra un campo, se conserva lo que había leído el primero. La respuesta trae un
+bloque `revision` que dice qué campos se releyeron, por qué, y qué leyó cada modelo:
+
+```json
+"revision": {
+  "modelo": "qwen/qwen3.8-27b",
+  "segundos": 132.2,
+  "campos": [
+    {
+      "campo": "inferior al centro.arriba de código de barras código",
+      "motivo": "configurado",
+      "modelo_vision": "142861200719 16300 86-12-29 FIRM-480208 001 CFE",
+      "modelo_revision": "01 142861200719 260907 000000170 5",
+      "cambio": true
+    },
+    {
+      "campo": "TOTAL A PAGAR:",
+      "motivo": "configurado",
+      "modelo_vision": 170.1,
+      "modelo_revision": 170,
+      "cambio": true
+    }
+  ]
+}
+```
+
+Si no hubo segunda pasada (`?revisar=false`, `LLM_REVISION_MODEL` vacío, o ningún campo
+dudoso), `revision` viene en `null`. Si el modelo grande falló, trae un campo `error`.
+
+El modelo de revisión no necesita estar cargado de antemano: LM Studio lo carga solo la
+primera vez que se le pide (unos 25 segundos extra en esa primera llamada).
 
 ## Límite de exactitud y hardware
 
-Sobre recibos escaneados, los dos métodos se quedan en **27 de 29 campos, ≈93 %**
-(`/pdf/extraer-ocr-ia` marca 26/29 en la tabla de arriba, pero una de esas tres
-diferencias es `TOTAL A PAGAR:`, donde lee `170.10` en vez de `170`: las dos lecturas son
-correctas, están impresas las dos en el recibo). Ese techo **no es del método: es de la
-tarjeta gráfica disponible**, y con más VRAM se puede cerrar la brecha sin salir de
-modelos locales.
+Medido sobre el recibo de ejemplo escaneado:
 
-El equipo actual tiene una **RTX 5070 Ti Laptop de 12 GB**. En esos 12 GB solo cabe entero
-un modelo de visión de ~7B (`qwen/qwen2.5-vl-7b`, 6 GB), que responde en ~12 s pero no
-alcanza a resolver la letra más chica del recibo —la línea de dígitos arriba del código de
-barras— ni algún fragmento del domicilio.
+| Configuración                                  | Tiempo    | Exactitud        |
+|------------------------------------------------|-----------|------------------|
+| Solo el modelo de 7B                           | ~15 s     | 26/29 (90 %)     |
+| **7B + revisión con el de 27B (por omisión)**  | ~2.5 min  | **28/29 (97 %)** |
+| Solo el modelo de 27B, recibo completo         | 489 s     | —                |
 
-Esto no es una suposición: se midió. Con **`qwen/qwen3.8-27b`**, un modelo casi cuatro
-veces más grande, la línea del código de barras salió **correcta y completa**
-(`01 142861200719 260907 000000170 5`), igual que el número de cuenta y la tarifa. El
-problema es que ese modelo pesa 17.74 GB y pide ~20 GiB con offload completo: no cabe en
-12 GB, parte de sus capas se ejecutan en CPU y tardaba **489 s por página** (8 minutos),
-lo que lo vuelve inviable en producción. Es decir: **la exactitud ya se alcanzó; lo que
-falta es la VRAM para lograrla a una velocidad usable.**
+El único campo que todavía difiere es el domicilio, **por un solo carácter**: el modelo
+lee `XOCHIMILCO.CDMX` donde el recibo dice `XOCHIMILCO,CDMX`.
+
+La exactitud ya está ahí; **lo que cuesta es el tiempo, y ese tiempo es de hardware**.
+El equipo tiene una **RTX 5070 Ti Laptop de 12 GB**. El modelo de 7B (6 GB) cabe entero y
+responde en segundos. El de 27B pesa 17.74 GB y necesita ~20 GiB para correr completo en
+la tarjeta: no cabe, la mayor parte de sus capas se ejecutan en CPU, y por eso la segunda
+pasada tarda 132 segundos aunque solo se le pidan tres campos. Pedirle solo los campos
+dudosos en lugar del recibo completo ya la bajó de 489 a 132 segundos; más allá de eso,
+el límite es la memoria de la tarjeta.
 
 Hay además un segundo efecto en la misma dirección. La letra chica se resuelve subiendo la
 resolución con la que se rasteriza la página, pero cada aumento de resolución multiplica
 los tokens de imagen y por lo tanto la memoria de contexto. Hoy se trabaja a ~180 dpi
-porque es lo que el presupuesto de VRAM permite; con más memoria se puede alimentar al
-modelo con la página a mayor resolución **y** usar un modelo más grande al mismo tiempo.
+porque es lo que el presupuesto de VRAM permite.
 
 | Tarjeta                            | VRAM  | Qué permite                                                                 |
 |------------------------------------|-------|------------------------------------------------------------------------------|
-| RTX 5070 Ti Laptop (actual)        | 12 GB | Modelo de 7B completo en GPU → ~12 s y ≈93 % de exactitud                     |
-| **RTX 5090**                       | 32 GB | Modelo de 27B–32B completo en GPU, con contexto amplio y mayor resolución     |
-| **RTX PRO 6000 Blackwell**         | 96 GB | Modelos de 72B o varios modelos cargados a la vez, sin concesiones de contexto |
+| RTX 5070 Ti Laptop (actual)        | 12 GB | 7B completo en GPU; el 27B corre casi todo en CPU → revisión de ~2 min        |
+| **RTX 5090**                       | 32 GB | 27B–32B completo en GPU: la revisión pasa de minutos a segundos, con más resolución |
+| **RTX PRO 6000 Blackwell**         | 96 GB | Modelos de 72B, o el 7B y el 27B cargados a la vez sin competir por memoria  |
 
-Con cualquiera de esas dos tarjetas, el modelo que ya demostró leer los campos que hoy
-fallan correría **completo en GPU**, es decir en segundos en lugar de minutos. La ruta para
-llevar la exactitud del 93 % hacia el 100 % **sin mandar un solo recibo a un servicio
-externo** —todo el procesamiento sigue ocurriendo en la máquina— es por ahí: **más VRAM,
-no más código**.
+Con cualquiera de esas dos tarjetas, el modelo de revisión correría **completo en GPU**:
+la misma exactitud del 97 % en segundos en lugar de minutos, y margen para acercarse al
+100 % —más resolución, o un modelo grande que lea el recibo entero en una sola pasada— **sin
+mandar un solo recibo a un servicio externo**. La ruta es **más VRAM, no más código**.
 
 Una precisión honesta sobre el 100 %: las cifras de este documento se midieron sobre el
 recibo de ejemplo, y ningún sistema de lectura puede garantizar exactitud perfecta sobre
-cualquier documento escaneado. Lo que sí está demostrado es que los campos que hoy se
-escapan **sí los lee un modelo más grande**, y que lo único que impide usarlo es la memoria
-de la tarjeta.
+cualquier documento escaneado. Lo que sí está demostrado es que los campos que el modelo
+chico no lee bien **sí los lee el modelo grande**, y que lo que impide usarlo a velocidad
+de producción es la memoria de la tarjeta.
 
 ## Cómo mandar el PDF
 
@@ -116,6 +188,7 @@ prioridad:
 | `ruta`    | query string | —           | PDF ya existente en el servidor                   |
 | `pagina`  | query string | `0`         | Página a procesar (la 0 es la primera)            |
 | `guardar` | query string | `true`      | Guardar el resultado en la base (ver más abajo)   |
+| `revisar` | query string | `true`      | Solo en `/pdf/extraer-ocr-ia`: releer los campos dudosos con el modelo grande (ver [Revisión con el modelo grande](#revisión-con-el-modelo-grande)) |
 
 ### Ejemplos
 
@@ -126,8 +199,11 @@ curl -X POST -F "archivo=@mi_recibo.pdf" http://127.0.0.1:8000/pdf/extraer-texto
 # Subir un recibo escaneado (OCR local, rápido)
 curl -X POST -F "archivo=@mi_recibo_escaneado.pdf" http://127.0.0.1:8000/pdf/extraer-ocr-pytorch
 
-# Recibo escaneado con el modelo de visión
+# Recibo escaneado con el modelo de visión (con revisión de los campos dudosos)
 curl -X POST -F "archivo=@mi_recibo_escaneado.pdf" http://127.0.0.1:8000/pdf/extraer-ocr-ia
+
+# Lo mismo, rápido y sin revisión
+curl -X POST -F "archivo=@mi_recibo_escaneado.pdf" "http://127.0.0.1:8000/pdf/extraer-ocr-ia?revisar=false"
 
 # Un PDF que ya está en el servidor, segunda página
 curl -X POST "http://127.0.0.1:8000/pdf/extraer-texto?ruta=configuracionPDF/recibo_CFE.pdf&pagina=1"
@@ -198,7 +274,9 @@ Puntos a tener en cuenta al consumir la respuesta:
 - **`datos` siempre trae las mismas llaves**, sin importar el endpoint que la haya
   producido. Un campo que no se pudo leer viene en `null`, nunca se omite.
 - **`metodo`** indica de dónde salieron los datos: `texto`, `ocr_pytorch` u `ocr_ia`.
-  `ocr_pytorch` agrega `dispositivo` (`cpu` o `cuda`) y `ocr_ia` agrega `modelo`.
+  `ocr_pytorch` agrega `dispositivo` (`cpu` o `cuda`); `ocr_ia` agrega `modelo` y
+  `revision` (qué campos releyó el modelo grande; ver
+  [Revisión con el modelo grande](#revisión-con-el-modelo-grande)).
 - **`guardado`** dice qué pasó con la base de datos (ver la sección siguiente). Si falla
   el guardado, la extracción igual se devuelve: `guardado.ok` viene en `false` con el motivo.
 - **Los identificadores llegan como texto** (`"01"`, `"142861200719"`), para no perder los
@@ -292,12 +370,17 @@ LLM_BASE_URL=http://localhost:1234/v1
 LLM_MODEL=qwen2.5-coder-14b-instruct
 LLM_VISION_MODEL=qwen/qwen2.5-vl-7b
 LLM_TIMEOUT=900
+
+LLM_REVISION_MODEL=qwen/qwen3.8-27b
+LLM_REVISION_CAMPOS=arriba de código de barras código;calle;TOTAL A PAGAR:
 ```
 
 | Variable            | Para qué                                                          |
 |---------------------|-------------------------------------------------------------------|
 | `LLM_BASE_URL`      | Servidor de LM Studio (API compatible con OpenAI)                 |
 | `LLM_VISION_MODEL`  | Modelo que lee la imagen en `/pdf/extraer-ocr-ia`                 |
+| `LLM_REVISION_MODEL`| Modelo grande que relee los campos dudosos. Vacío = sin revisión  |
+| `LLM_REVISION_CAMPOS`| Campos que siempre se releen, separados por `;`                  |
 | `LLM_TIMEOUT`       | Segundos de espera por la respuesta del modelo                    |
 | `DB_DATABASE`       | Archivo SQLite donde se guardan los recibos                       |
 | `DB_CONNECTION`     | Motor de base de datos; hoy solo se usa SQLite                    |

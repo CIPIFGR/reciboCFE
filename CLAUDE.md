@@ -70,13 +70,29 @@ antes de implementarla.**
     27B sí leyó la línea del código de barras que el 7B falla, pero tardaba 489 s por no
     caber en 12 GB.
 
+### 2026-09-19 — Séptima instrucción
+
+15. En `extraer-ocr-ia` el 7B obtiene 26/29 campos. Los 3 que no localiza, intentarlos con
+    **Qwen3.8 27B**; los que sí encuentra, dejarlos con **Qwen2.5 VL 7B**.
+    Hecho: segunda pasada en `pdf_ocr_service.py`. Resultado medido: **26/29 → 28/29**,
+    16.7 s → 143.5 s (132 s del 27B). Solo difiere `calle` por un carácter
+    (`XOCHIMILCO.CDMX` contra `XOCHIMILCO,CDMX`). Con `?revisar=false` se omite.
+
+    Matiz importante que se le explicó al usuario: los 3 campos **no venían vacíos**, el
+    7B los leía mal (código de barras con otros números, una errata en el domicilio y el
+    `Total` del desglose en lugar de `TOTAL A PAGAR`). En producción no hay respuesta
+    correcta contra la cual comparar, así que "los que no localiza" se detectan por
+    reglas verificables (vacío, formato, cuadres) **más** una lista medida de campos que
+    el 7B lee mal siempre (`LLM_REVISION_CAMPOS`). Solo el código de barras era
+    detectable por regla; los otros dos únicamente por la lista.
+
 ## Qué es
 
 API Litestar que extrae datos de recibos de CFE. Tres caminos según el PDF:
 
 - **con capa de texto** → `pdfplumber` ([app/Service/pdf_texto_service.py](app/Service/pdf_texto_service.py)), ~0.1 s
 - **escaneado, rápido** → EasyOCR/PyTorch ([app/Service/pdf_ocr_pytorch_service.py](app/Service/pdf_ocr_pytorch_service.py)), ~11 s
-- **escaneado, con modelo de visión** → LM Studio ([app/Service/pdf_ocr_service.py](app/Service/pdf_ocr_service.py)), ~12 s
+- **escaneado, con modelos de visión** → LM Studio ([app/Service/pdf_ocr_service.py](app/Service/pdf_ocr_service.py)): 7B en ~15 s y revisión de campos dudosos con el 27B, ~2.5 min en total
 
 Los tres devuelven **exactamente el mismo JSON**. Los dos primeros comparten
 [app/Service/extractor_layout.py](app/Service/extractor_layout.py): reciben palabras con
@@ -167,18 +183,36 @@ Los modelos de EasyOCR se cargan una sola vez (~6 s en la primera llamada) y que
 **Precisión medida** contra `recibo_CFE_imagen.pdf`: 27 de 29 campos idénticos a la lectura
 por texto. Falla `CUENTA` y `TARIFA` (ver abajo).
 
-**`extraer_ocr_ia`** (modelo de visión en LM Studio):
+**`extraer_ocr_ia`** (modelos de visión en LM Studio, dos pasadas):
 
-- render a ~180 dpi, PNG en base64;
-- el prompt incluye el JSON Schema derivado de `estructuraPDF.json` y pide salida estructurada;
-- la respuesta se vacía en la misma plantilla, ignorando llaves extra y normalizando
-  `"null"`, `"N/A"` y cadenas vacías a `null`.
+- render a ~180 dpi, PNG en base64, **una sola vez** para las dos pasadas;
+- 1a pasada con `LLM_VISION_MODEL` (7B): el prompt incluye el JSON Schema completo derivado
+  de `estructuraPDF.json` y pide salida estructurada;
+- `campos_dudosos()` arma `{ruta: motivo}`: `configurado` (`LLM_REVISION_CAMPOS`), `vacio`,
+  `formato` (código de barras solo dígitos) y `no cuadra` (lecturas contra `total_periodo`
+  con multiplicador; `Energía + IVA 16%` contra `Fac. del Periodo`, ±0.05);
+- 2a pasada con `LLM_REVISION_MODEL` (27B) usando `_esquema_parcial()`: el JSON Schema
+  recortado a esos campos. Pedir 3 campos en vez del recibo completo bajó el 27B de 489 s
+  a 132 s;
+- se fusiona solo lo que el 27B sí trajo; si falla (`LMStudioError`) se conserva lo del
+  7B y se reporta en `revision.error`. **La revisión nunca empeora la extracción**;
+- ambas respuestas pasan por `normalizar()`: misma plantilla, mismos tipos. Una respuesta
+  parcial deja en `None` lo que no trae, por eso la fusión ignora los `None`.
 
-**Precisión medida** con `qwen/qwen2.5-vl-7b`: 26 de 29 campos. Acierta `CUENTA` y `TARIFA`
+Nombres de campo con punto (`NO. DE SERVICIO`, `Fac. del Periodo`): `_resolver()` busca
+primero el nombre exacto y solo si no existe interpreta el último punto como
+`grupo.subcampo` (`lectura_actual.valor`). No partir por `.` a ciegas.
+
+El 27B se carga solo por JIT de LM Studio al pedirlo (contexto 8192, TTL 1 h) y convive
+con el 7B: VRAM ~11.8 GB de 12, casi todo el 27B en CPU. Probado sin caídas.
+
+**Precisión medida** con `qwen/qwen2.5-vl-7b` solo (`?revisar=false`): 26 de 29 campos. Acierta `CUENTA` y `TARIFA`
 (donde falla EasyOCR), pero no lee bien la línea de dígitos del código de barras —son muy
 chicos— y deja alguna errata en el domicilio. `TOTAL A PAGAR:` lo da como 170.1 (el total
-con centavos) mientras el extractor de texto lee el 170 del recuadro grande: las dos
-lecturas son defendibles. Subir `ESCALA_RENDER` a 3.5 acerca el código de barras pero no
+con centavos, que es el renglón `Total` del desglose) mientras el extractor de texto lee
+el 170 del recuadro `TOTAL A PAGAR`, que es el campo pedido: el 7B confunde renglones.
+Se agregó al prompt una instrucción específica y **no lo corrigió**; lo corrige la
+revisión con el 27B. Subir `ESCALA_RENDER` a 3.5 acerca el código de barras pero no
 lo corrige y cuesta 3 s más, por eso se quedó en 2.5.
 
 ## Detalles del recibo CFE que ya costaron trabajo

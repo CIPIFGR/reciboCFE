@@ -68,10 +68,13 @@ class PDFController(Controller):
         ruta: str | None = None,
         pagina: int = 0,
         guardar: bool = True,
+        revisar: bool = True,
     ) -> dict[str, Any]:
         origen = await self._origen(data.archivo, ruta, PDF_IMAGEN_EJEMPLO)
         try:
-            resultado = await pdf_ocr_service.extraer(origen, pagina=pagina)
+            resultado, revision = await pdf_ocr_service.extraer(
+                origen, pagina=pagina, revisar=revisar
+            )
         except LMStudioError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
@@ -79,6 +82,7 @@ class PDFController(Controller):
         return {
             "metodo": "ocr_ia",
             "modelo": lm_studio_client.modelo_vision,
+            "revision": revision,
             "guardado": await self._guardar(resultado, "ocr_ia", data.archivo, ruta, guardar),
             "datos": resultado,
         }
@@ -116,6 +120,7 @@ class PDFController(Controller):
             "lm_studio": lm_studio_client.base_url,
             "modelos": modelos,
             "modelo_vision": lm_studio_client.modelo_vision,
+            "modelo_revision": lm_studio_client.modelo_revision or None,
             "ocr_pytorch": {"dispositivo": "cuda" if hay_gpu() else "cpu"},
         }
 
